@@ -1,0 +1,1598 @@
+<html lang="ja" style="background-color: transparent;"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>運転日報</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&display=swap');
+
+  :root {
+    --teal: #2a9d8f;
+    --teal-dark: #1e7a6f;
+    --teal-light: #e8f7f5;
+    --teal-mid: #b2e0da;
+    --text: #1a2e2c;
+    --muted: #5a7a77;
+    --border: #cce8e4;
+    --white: #ffffff;
+    --bg: #f0faf8;
+    --red: #e63946;
+    --shadow: 0 2px 12px rgba(42,157,143,0.12);
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: 'Noto Sans JP', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    padding-bottom: 40px;
+  }
+
+  header {
+    background: var(--teal);
+    color: white;
+    padding: 16px 20px 14px;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+  }
+
+  header h1 {
+    font-size: 18px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-align: center;
+  }
+
+  .container { padding: 16px; max-width: 600px; margin: 0 auto; }
+
+  /* Section Cards */
+  .card {
+    background: white;
+    border-radius: 14px;
+    box-shadow: var(--shadow);
+    margin-bottom: 16px;
+    overflow: hidden;
+  }
+
+  .card-title {
+    background: var(--teal);
+    color: white;
+    font-size: 13px;
+    font-weight: 700;
+    padding: 9px 16px;
+    letter-spacing: 0.08em;
+  }
+
+  .card-body { padding: 14px 16px; }
+
+  /* Field Rows */
+  .field {
+    display: flex;
+    align-items: center;
+    margin-bottom: 12px;
+  }
+  .field:last-child { margin-bottom: 0; }
+
+  .field label {
+    font-size: 13px;
+    color: var(--muted);
+    font-weight: 500;
+    width: 95px;
+    flex-shrink: 0;
+  }
+
+  .field input, .field select {
+    flex: 1;
+    border: 1.5px solid var(--border);
+    border-radius: 8px;
+    padding: 9px 12px;
+    font-size: 15px;
+    font-family: inherit;
+    color: var(--text);
+    background: var(--white);
+    outline: none;
+    transition: border-color 0.2s;
+    -webkit-appearance: none;
+  }
+
+  .field input:focus, .field select:focus {
+    border-color: var(--teal);
+    box-shadow: 0 0 0 3px rgba(42,157,143,0.12);
+  }
+
+  /* Time Row — HH : MM dropdowns */
+  .time-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 1;
+  }
+
+  .time-row select {
+    width: 68px;
+    flex: none;
+    text-align: center;
+    padding: 9px 4px 9px 8px;
+    font-size: 15px;
+    border: 1.5px solid var(--border);
+    border-radius: 8px;
+    font-family: inherit;
+    color: var(--text);
+    background: white;
+    outline: none;
+    -webkit-appearance: none;
+    appearance: none;
+    cursor: pointer;
+    transition: border-color 0.2s;
+  }
+  .time-row select:focus { border-color: var(--teal); box-shadow: 0 0 0 3px rgba(42,157,143,0.12); }
+
+  .time-sep {
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--teal);
+    line-height: 1;
+  }
+
+  .time-label {
+    font-size: 12px;
+    color: var(--muted);
+    margin-left: 2px;
+  }
+
+  /* Date selects */
+  .date-row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex: 1;
+  }
+  .date-row select {
+    border: 1.5px solid var(--border);
+    border-radius: 8px;
+    padding: 9px 4px 9px 8px;
+    font-size: 14px;
+    font-family: inherit;
+    color: var(--text);
+    background: white;
+    outline: none;
+    -webkit-appearance: none;
+    appearance: none;
+    cursor: pointer;
+    transition: border-color 0.2s;
+  }
+  .date-row select:focus { border-color: var(--teal); box-shadow: 0 0 0 3px rgba(42,157,143,0.12); }
+  .date-row .sel-year { width: 82px; }
+  .date-row .sel-month { width: 56px; }
+  .date-row .sel-day { width: 56px; }
+  .date-row .date-sep { font-size: 14px; color: var(--muted); font-weight: 600; }
+
+  /* Auto-calc display */
+  .calc-display {
+    flex: 1;
+    background: var(--teal-light);
+    border: 1.5px solid var(--teal-mid);
+    border-radius: 8px;
+    padding: 9px 12px;
+    font-size: 15px;
+    font-weight: 700;
+    color: var(--teal-dark);
+    min-height: 40px;
+  }
+
+  /* Checklist */
+  .check-list { display: flex; flex-direction: column; gap: 10px; }
+
+  .check-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    background: var(--teal-light);
+    border-radius: 10px;
+    padding: 11px 14px;
+    cursor: pointer;
+    user-select: none;
+    transition: background 0.15s;
+  }
+
+  .check-item:active { background: var(--teal-mid); }
+
+  .check-item input[type="checkbox"] { display: none; }
+
+  .check-box {
+    width: 26px;
+    height: 26px;
+    border-radius: 6px;
+    border: 2px solid var(--teal);
+    background: white;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    transition: background 0.15s, border-color 0.15s;
+  }
+
+  .check-box svg { display: none; }
+
+  .check-item input[type="checkbox"]:checked ~ .check-text { color: var(--teal-dark); font-weight: 700; }
+  .check-item input[type="checkbox"]:checked + .check-box {
+    background: var(--teal);
+    border-color: var(--teal);
+  }
+  .check-item input[type="checkbox"]:checked + .check-box svg { display: block; }
+
+  .check-text { font-size: 14px; color: var(--text); }
+
+  /* Route Table */
+  .route-table { width: 100%; border-collapse: collapse; }
+
+  .route-table th {
+    background: var(--teal-light);
+    font-size: 11px;
+    color: var(--muted);
+    font-weight: 600;
+    padding: 6px 4px;
+    text-align: center;
+    border-bottom: 1.5px solid var(--teal-mid);
+  }
+
+  .route-table td { padding: 4px 3px; vertical-align: middle; }
+
+  .route-table input {
+    width: 100%;
+    border: 1.5px solid var(--border);
+    border-radius: 7px;
+    padding: 7px 5px;
+    font-size: 13px;
+    font-family: inherit;
+    text-align: center;
+    outline: none;
+    background: white;
+    transition: border-color 0.2s;
+  }
+
+  .route-table input:focus {
+    border-color: var(--teal);
+    box-shadow: 0 0 0 2px rgba(42,157,143,0.1);
+  }
+
+  .route-table .dest-input { text-align: left; padding-left: 7px; }
+
+  /* Destination select */
+  .route-table select {
+    width: 100%;
+    border: 1.5px solid var(--border);
+    border-radius: 7px;
+    padding: 7px 5px;
+    font-size: 13px;
+    font-family: inherit;
+    color: var(--text);
+    background: white;
+    outline: none;
+    transition: border-color 0.2s;
+    -webkit-appearance: none;
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%232a9d8f' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 6px center;
+    padding-right: 22px;
+  }
+  .route-table select:focus {
+    border-color: var(--teal);
+    box-shadow: 0 0 0 2px rgba(42,157,143,0.1);
+  }
+
+  /* Delete row button */
+  .del-row-btn {
+    background: none;
+    border: none;
+    color: #ccc;
+    font-size: 18px;
+    cursor: pointer;
+    padding: 4px;
+    line-height: 1;
+    transition: color 0.15s;
+  }
+  .del-row-btn:active { color: var(--red); }
+
+  /* Destination manager modal */
+  .modal-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.45);
+    z-index: 200;
+    align-items: flex-end;
+    justify-content: center;
+  }
+  .modal-overlay.open { display: flex; }
+
+  .modal-sheet {
+    background: white;
+    border-radius: 20px 20px 0 0;
+    width: 100%;
+    max-width: 600px;
+    padding: 20px 16px 36px;
+    max-height: 80vh;
+    overflow-y: auto;
+    animation: slideUp 0.25s ease;
+  }
+  @keyframes slideUp {
+    from { transform: translateY(60px); opacity: 0; }
+    to   { transform: translateY(0);    opacity: 1; }
+  }
+
+  .modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 16px;
+  }
+  .modal-header h2 { font-size: 16px; font-weight: 700; }
+  .modal-close {
+    background: #f0f0f0;
+    border: none;
+    border-radius: 50%;
+    width: 32px;
+    height: 32px;
+    font-size: 18px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--muted);
+  }
+
+  .dest-tag-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 16px;
+    min-height: 40px;
+  }
+
+  .dest-tag {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--teal-light);
+    border: 1.5px solid var(--teal-mid);
+    border-radius: 20px;
+    padding: 6px 12px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--teal-dark);
+  }
+
+  .dest-tag button {
+    background: none;
+    border: none;
+    color: var(--teal);
+    cursor: pointer;
+    font-size: 15px;
+    line-height: 1;
+    padding: 0;
+    opacity: 0.6;
+  }
+  .dest-tag button:active { opacity: 1; color: var(--red); }
+
+  .dest-add-row {
+    display: flex;
+    gap: 8px;
+  }
+
+  .dest-add-row input {
+    flex: 1;
+    border: 1.5px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 14px;
+    font-size: 14px;
+    font-family: inherit;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+  .dest-add-row input:focus { border-color: var(--teal); }
+
+  .dest-add-row button {
+    background: var(--teal);
+    color: white;
+    border: none;
+    border-radius: 10px;
+    padding: 10px 18px;
+    font-size: 14px;
+    font-weight: 700;
+    font-family: inherit;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .dest-add-row button:active { background: var(--teal-dark); }
+
+  .manage-dest-btn {
+    width: 100%;
+    margin-bottom: 8px;
+    background: white;
+    border: 1.5px solid var(--teal);
+    border-radius: 9px;
+    color: var(--teal-dark);
+    font-size: 13px;
+    font-weight: 600;
+    padding: 8px;
+    cursor: pointer;
+    font-family: inherit;
+    transition: background 0.15s;
+  }
+  .manage-dest-btn:active { background: var(--teal-light); }
+
+  .add-row-btn {
+    width: 100%;
+    margin-top: 10px;
+    background: var(--teal-light);
+    border: 1.5px dashed var(--teal);
+    border-radius: 9px;
+    color: var(--teal-dark);
+    font-size: 14px;
+    font-weight: 600;
+    padding: 9px;
+    cursor: pointer;
+    font-family: inherit;
+    transition: background 0.15s;
+  }
+
+  .add-row-btn:active { background: var(--teal-mid); }
+
+  /* Meter */
+  .meter-result {
+    background: var(--teal);
+    color: white;
+    border-radius: 10px;
+    padding: 12px 16px;
+    margin-top: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .meter-result span:first-child { font-size: 13px; opacity: 0.85; }
+  .meter-result .meter-val { font-size: 22px; font-weight: 700; }
+
+  /* Alcohol Check */
+  .alcohol-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+
+  .alcohol-block {
+    background: var(--teal-light);
+    border-radius: 10px;
+    padding: 12px;
+  }
+
+  .alcohol-block .block-title {
+    font-size: 11px;
+    color: var(--muted);
+    font-weight: 600;
+    margin-bottom: 8px;
+    text-align: center;
+  }
+
+  .alcohol-block .field { margin-bottom: 8px; }
+  .alcohol-block .field label { width: 44px; font-size: 12px; }
+  .alcohol-block .field input { font-size: 14px; padding: 7px 8px; }
+
+  /* Radio toggle */
+  .toggle-group {
+    display: flex;
+    border-radius: 8px;
+    overflow: hidden;
+    border: 1.5px solid var(--border);
+    flex: 1;
+  }
+
+  .toggle-group label {
+    flex: 1;
+    text-align: center;
+    padding: 8px 4px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--muted);
+    cursor: pointer;
+    background: white;
+    transition: background 0.15s, color 0.15s;
+    width: auto;
+  }
+
+  .toggle-group input[type="radio"] { display: none; }
+  .toggle-group input[type="radio"]:checked + label {
+    background: var(--teal);
+    color: white;
+  }
+
+  /* Submit */
+  .submit-btn {
+    width: 100%;
+    background: var(--teal);
+    color: white;
+    border: none;
+    border-radius: 12px;
+    padding: 16px;
+    font-size: 16px;
+    font-weight: 700;
+    font-family: inherit;
+    letter-spacing: 0.06em;
+    cursor: pointer;
+    box-shadow: 0 4px 14px rgba(42,157,143,0.35);
+    transition: background 0.15s, transform 0.1s;
+    margin-top: 4px;
+  }
+
+  .submit-btn:active {
+    background: var(--teal-dark);
+    transform: scale(0.98);
+  }
+
+  /* Toast */
+  .toast {
+    position: fixed;
+    bottom: 24px;
+    left: 50%;
+    transform: translateX(-50%) translateY(80px);
+    background: var(--teal-dark);
+    color: white;
+    padding: 12px 24px;
+    border-radius: 40px;
+    font-size: 14px;
+    font-weight: 600;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.2);
+    transition: transform 0.3s cubic-bezier(0.34,1.56,0.64,1);
+    z-index: 999;
+    white-space: nowrap;
+  }
+  .toast.show { transform: translateX(-50%) translateY(0); }
+</style>
+</head>
+<body id="artifacts-component-root-html" style="background-color: transparent;">
+
+<header><h1>🚗 運転日報</h1></header>
+
+<div class="container">
+
+  <!-- 基本情報 -->
+  <div class="card">
+    <div class="card-title">📋 基本情報</div>
+    <div class="card-body">
+      <div class="field">
+        <label>運転年月日</label>
+        <div class="date-row">
+          <select class="sel-year" id="sel-year" onchange="updateWeekday()"><option value="2024">2024</option><option value="2025">2025</option><option value="2026" selected="">2026</option><option value="2027">2027</option><option value="2028">2028</option></select>
+          <span class="date-sep">年</span>
+          <select class="sel-month" id="sel-month" onchange="updateWeekday()"><option value="1">01</option><option value="2">02</option><option value="3">03</option><option value="4">04</option><option value="5" selected="">05</option><option value="6">06</option><option value="7">07</option><option value="8">08</option><option value="9">09</option><option value="10">10</option><option value="11">11</option><option value="12">12</option></select>
+          <span class="date-sep">月</span>
+          <select class="sel-day" id="sel-day" onchange="updateWeekday()"><option value="1">01</option><option value="2" selected="">02</option><option value="3">03</option><option value="4">04</option><option value="5">05</option><option value="6">06</option><option value="7">07</option><option value="8">08</option><option value="9">09</option><option value="10">10</option><option value="11">11</option><option value="12">12</option><option value="13">13</option><option value="14">14</option><option value="15">15</option><option value="16">16</option><option value="17">17</option><option value="18">18</option><option value="19">19</option><option value="20">20</option><option value="21">21</option><option value="22">22</option><option value="23">23</option><option value="24">24</option><option value="25">25</option><option value="26">26</option><option value="27">27</option><option value="28">28</option><option value="29">29</option><option value="30">30</option><option value="31">31</option></select>
+          <span class="date-sep">日</span>
+        </div>
+      </div>
+      <div class="field">
+        <label>曜日</label>
+        <input type="text" id="weekday" readonly="" style="background:#f5f5f5;color:var(--teal-dark);font-weight:700;">
+      </div>
+      <div class="field">
+        <label>運転者名</label>
+        <input type="text" placeholder="氏名を入力" id="driver-name">
+      </div>
+      <div class="field">
+        <label>車両番号</label>
+        <input type="text" placeholder="例: 品川 500 あ 1234" id="vehicle-no">
+      </div>
+    </div>
+  </div>
+
+  <!-- 時間 -->
+  <div class="card">
+    <div class="card-title">⏱ 時間記録</div>
+    <div class="card-body">
+      <div class="field">
+        <label>出庫時間</label>
+        <div class="time-row">
+          <select id="out-h" onchange="calcDriveTime()"><option value="0">00時</option><option value="1">01時</option><option value="2">02時</option><option value="3">03時</option><option value="4">04時</option><option value="5">05時</option><option value="6">06時</option><option value="7">07時</option><option value="8" selected="">08時</option><option value="9">09時</option><option value="10">10時</option><option value="11">11時</option><option value="12">12時</option><option value="13">13時</option><option value="14">14時</option><option value="15">15時</option><option value="16">16時</option><option value="17">17時</option><option value="18">18時</option><option value="19">19時</option><option value="20">20時</option><option value="21">21時</option><option value="22">22時</option><option value="23">23時</option></select>
+          <span class="time-sep">:</span>
+          <select id="out-m" onchange="calcDriveTime()"><option value="0">00分</option><option value="5">05分</option><option value="10" selected="">10分</option><option value="15">15分</option><option value="20">20分</option><option value="25">25分</option><option value="30">30分</option><option value="35">35分</option><option value="40">40分</option><option value="45">45分</option><option value="50">50分</option><option value="55">55分</option></select>
+        </div>
+      </div>
+      <div class="field">
+        <label>入庫時間</label>
+        <div class="time-row">
+          <select id="in-h" onchange="calcDriveTime()"><option value="0">00時</option><option value="1">01時</option><option value="2">02時</option><option value="3">03時</option><option value="4">04時</option><option value="5">05時</option><option value="6">06時</option><option value="7">07時</option><option value="8">08時</option><option value="9">09時</option><option value="10">10時</option><option value="11">11時</option><option value="12">12時</option><option value="13">13時</option><option value="14">14時</option><option value="15">15時</option><option value="16">16時</option><option value="17" selected="">17時</option><option value="18">18時</option><option value="19">19時</option><option value="20">20時</option><option value="21">21時</option><option value="22">22時</option><option value="23">23時</option></select>
+          <span class="time-sep">:</span>
+          <select id="in-m" onchange="calcDriveTime()"><option value="0" selected="">00分</option><option value="5">05分</option><option value="10">10分</option><option value="15">15分</option><option value="20">20分</option><option value="25">25分</option><option value="30">30分</option><option value="35">35分</option><option value="40">40分</option><option value="45">45分</option><option value="50">50分</option><option value="55">55分</option></select>
+        </div>
+      </div>
+      <div class="field">
+        <label>運転時間</label>
+        <div class="calc-display" id="drive-time">8時間 50分</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 点検 -->
+  <div class="card">
+    <div class="card-title">✅ 点検事項</div>
+    <div class="card-body">
+      <div class="check-list">
+        <label class="check-item">
+          <input type="checkbox" checked="">
+          <div class="check-box"><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><polyline points="2,7 6,11 12,3" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"></polyline></svg></div>
+          <span class="check-text">操縦装置（ハンドル部）</span>
+        </label>
+        <label class="check-item">
+          <input type="checkbox" checked="">
+          <div class="check-box"><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><polyline points="2,7 6,11 12,3" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"></polyline></svg></div>
+          <span class="check-text">制動装置（ブレーキ部）</span>
+        </label>
+        <label class="check-item">
+          <input type="checkbox" checked="">
+          <div class="check-box"><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><polyline points="2,7 6,11 12,3" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"></polyline></svg></div>
+          <span class="check-text">電気装置（前照灯・方向指示器等）</span>
+        </label>
+        <label class="check-item">
+          <input type="checkbox" checked="">
+          <div class="check-box"><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><polyline points="2,7 6,11 12,3" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"></polyline></svg></div>
+          <span class="check-text">ガソリン・オイル</span>
+        </label>
+        <label class="check-item">
+          <input type="checkbox" checked="">
+          <div class="check-box"><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><polyline points="2,7 6,11 12,3" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"></polyline></svg></div>
+          <span class="check-text">ラジエータ水</span>
+        </label>
+      </div>
+    </div>
+  </div>
+
+  <!-- 発着時間・行先 -->
+  <div class="card">
+    <div class="card-title">🗺 発着・行先記録</div>
+    <div class="card-body">
+      <button class="manage-dest-btn" onclick="openDestModal()">⚙ 行先リストを編集</button>
+      <button class="manage-dest-btn" onclick="openNoteModal()" style="margin-bottom:8px">⚙ 摘要リストを編集</button>
+      <table class="route-table">
+        <thead>
+          <tr>
+            <th style="width:46px">発</th>
+            <th style="width:46px">着</th>
+            <th>行先</th>
+            <th style="width:50px">摘要</th>
+            <th style="width:28px"></th>
+          </tr>
+        </thead>
+        <tbody id="route-body"><tr>
+    <td><div style="display:flex;align-items:center;gap:2px">
+    <select style="width:50px;border:1.5px solid var(--border);border-radius:6px;padding:5px 2px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white"><option value="0">00</option><option value="1">01</option><option value="2">02</option><option value="3">03</option><option value="4">04</option><option value="5">05</option><option value="6">06</option><option value="7">07</option><option value="8" selected="">08</option><option value="9">09</option><option value="10">10</option><option value="11">11</option><option value="12">12</option><option value="13">13</option><option value="14">14</option><option value="15">15</option><option value="16">16</option><option value="17">17</option><option value="18">18</option><option value="19">19</option><option value="20">20</option><option value="21">21</option><option value="22">22</option><option value="23">23</option></select>
+    <span style="color:var(--teal);font-weight:700">:</span>
+    <select style="width:50px;border:1.5px solid var(--border);border-radius:6px;padding:5px 2px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white"><option value="0">00</option>,<option value="5">05</option>,<option value="10">10</option>,<option value="15" selected="">15</option>,<option value="20">20</option>,<option value="25">25</option>,<option value="30">30</option>,<option value="35">35</option>,<option value="40">40</option>,<option value="45">45</option>,<option value="50">50</option>,<option value="55">55</option></select>
+  </div></td>
+    <td><div style="display:flex;align-items:center;gap:2px">
+    <select style="width:50px;border:1.5px solid var(--border);border-radius:6px;padding:5px 2px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white"><option value="0">00</option><option value="1">01</option><option value="2">02</option><option value="3">03</option><option value="4">04</option><option value="5">05</option><option value="6">06</option><option value="7">07</option><option value="8">08</option><option value="9" selected="">09</option><option value="10">10</option><option value="11">11</option><option value="12">12</option><option value="13">13</option><option value="14">14</option><option value="15">15</option><option value="16">16</option><option value="17">17</option><option value="18">18</option><option value="19">19</option><option value="20">20</option><option value="21">21</option><option value="22">22</option><option value="23">23</option></select>
+    <span style="color:var(--teal);font-weight:700">:</span>
+    <select style="width:50px;border:1.5px solid var(--border);border-radius:6px;padding:5px 2px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white"><option value="0" selected="">00</option>,<option value="5">05</option>,<option value="10">10</option>,<option value="15">15</option>,<option value="20">20</option>,<option value="25">25</option>,<option value="30">30</option>,<option value="35">35</option>,<option value="40">40</option>,<option value="45">45</option>,<option value="50">50</option>,<option value="55">55</option></select>
+  </div></td>
+    <td><select class="dest-select"><option value="">-- 行先を選択 --</option><option value="Amazon DS" selected="">Amazon DS</option><option value="団地">団地</option><option value="公園">公園</option><option value="住宅街">住宅街</option><option value="AmazonDS">AmazonDS</option><option value="自宅営業所">自宅営業所</option></select></td>
+    <td><select class="note-select" style="width:100%;border:1.5px solid var(--border);border-radius:6px;padding:6px 3px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white"><option value="">摘要</option><option value="集荷" selected="">集荷</option><option value="配送">配送</option><option value="休憩">休憩</option><option value="持ち戻り">持ち戻り</option><option value="帰庫">帰庫</option><option value="その他">その他</option></select></td>
+    <td><button class="del-row-btn" onclick="this.closest('tr').remove()">×</button></td>
+  </tr><tr>
+    <td><div style="display:flex;align-items:center;gap:2px">
+    <select style="width:50px;border:1.5px solid var(--border);border-radius:6px;padding:5px 2px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white"><option value="0">00</option><option value="1">01</option><option value="2">02</option><option value="3">03</option><option value="4">04</option><option value="5">05</option><option value="6">06</option><option value="7">07</option><option value="8">08</option><option value="9" selected="">09</option><option value="10">10</option><option value="11">11</option><option value="12">12</option><option value="13">13</option><option value="14">14</option><option value="15">15</option><option value="16">16</option><option value="17">17</option><option value="18">18</option><option value="19">19</option><option value="20">20</option><option value="21">21</option><option value="22">22</option><option value="23">23</option></select>
+    <span style="color:var(--teal);font-weight:700">:</span>
+    <select style="width:50px;border:1.5px solid var(--border);border-radius:6px;padding:5px 2px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white"><option value="0">00</option>,<option value="5">05</option>,<option value="10">10</option>,<option value="15" selected="">15</option>,<option value="20">20</option>,<option value="25">25</option>,<option value="30">30</option>,<option value="35">35</option>,<option value="40">40</option>,<option value="45">45</option>,<option value="50">50</option>,<option value="55">55</option></select>
+  </div></td>
+    <td><div style="display:flex;align-items:center;gap:2px">
+    <select style="width:50px;border:1.5px solid var(--border);border-radius:6px;padding:5px 2px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white"><option value="0">00</option><option value="1">01</option><option value="2">02</option><option value="3">03</option><option value="4">04</option><option value="5">05</option><option value="6">06</option><option value="7">07</option><option value="8">08</option><option value="9">09</option><option value="10">10</option><option value="11">11</option><option value="12" selected="">12</option><option value="13">13</option><option value="14">14</option><option value="15">15</option><option value="16">16</option><option value="17">17</option><option value="18">18</option><option value="19">19</option><option value="20">20</option><option value="21">21</option><option value="22">22</option><option value="23">23</option></select>
+    <span style="color:var(--teal);font-weight:700">:</span>
+    <select style="width:50px;border:1.5px solid var(--border);border-radius:6px;padding:5px 2px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white"><option value="0" selected="">00</option>,<option value="5">05</option>,<option value="10">10</option>,<option value="15">15</option>,<option value="20">20</option>,<option value="25">25</option>,<option value="30">30</option>,<option value="35">35</option>,<option value="40">40</option>,<option value="45">45</option>,<option value="50">50</option>,<option value="55">55</option></select>
+  </div></td>
+    <td><select class="dest-select"><option value="">-- 行先を選択 --</option><option value="Amazon DS">Amazon DS</option><option value="団地" selected="">団地</option><option value="公園">公園</option><option value="住宅街">住宅街</option><option value="AmazonDS">AmazonDS</option><option value="自宅営業所">自宅営業所</option></select></td>
+    <td><select class="note-select" style="width:100%;border:1.5px solid var(--border);border-radius:6px;padding:6px 3px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white"><option value="">摘要</option><option value="集荷">集荷</option><option value="配送" selected="">配送</option><option value="休憩">休憩</option><option value="持ち戻り">持ち戻り</option><option value="帰庫">帰庫</option><option value="その他">その他</option></select></td>
+    <td><button class="del-row-btn" onclick="this.closest('tr').remove()">×</button></td>
+  </tr><tr>
+    <td><div style="display:flex;align-items:center;gap:2px">
+    <select style="width:50px;border:1.5px solid var(--border);border-radius:6px;padding:5px 2px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white"><option value="0">00</option><option value="1">01</option><option value="2">02</option><option value="3">03</option><option value="4">04</option><option value="5">05</option><option value="6">06</option><option value="7">07</option><option value="8">08</option><option value="9">09</option><option value="10">10</option><option value="11">11</option><option value="12" selected="">12</option><option value="13">13</option><option value="14">14</option><option value="15">15</option><option value="16">16</option><option value="17">17</option><option value="18">18</option><option value="19">19</option><option value="20">20</option><option value="21">21</option><option value="22">22</option><option value="23">23</option></select>
+    <span style="color:var(--teal);font-weight:700">:</span>
+    <select style="width:50px;border:1.5px solid var(--border);border-radius:6px;padding:5px 2px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white"><option value="0" selected="">00</option>,<option value="5">05</option>,<option value="10">10</option>,<option value="15">15</option>,<option value="20">20</option>,<option value="25">25</option>,<option value="30">30</option>,<option value="35">35</option>,<option value="40">40</option>,<option value="45">45</option>,<option value="50">50</option>,<option value="55">55</option></select>
+  </div></td>
+    <td><div style="display:flex;align-items:center;gap:2px">
+    <select style="width:50px;border:1.5px solid var(--border);border-radius:6px;padding:5px 2px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white"><option value="0">00</option><option value="1">01</option><option value="2">02</option><option value="3">03</option><option value="4">04</option><option value="5">05</option><option value="6">06</option><option value="7">07</option><option value="8">08</option><option value="9">09</option><option value="10">10</option><option value="11">11</option><option value="12" selected="">12</option><option value="13">13</option><option value="14">14</option><option value="15">15</option><option value="16">16</option><option value="17">17</option><option value="18">18</option><option value="19">19</option><option value="20">20</option><option value="21">21</option><option value="22">22</option><option value="23">23</option></select>
+    <span style="color:var(--teal);font-weight:700">:</span>
+    <select style="width:50px;border:1.5px solid var(--border);border-radius:6px;padding:5px 2px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white"><option value="0">00</option>,<option value="5">05</option>,<option value="10">10</option>,<option value="15">15</option>,<option value="20">20</option>,<option value="25">25</option>,<option value="30" selected="">30</option>,<option value="35">35</option>,<option value="40">40</option>,<option value="45">45</option>,<option value="50">50</option>,<option value="55">55</option></select>
+  </div></td>
+    <td><select class="dest-select"><option value="">-- 行先を選択 --</option><option value="Amazon DS">Amazon DS</option><option value="団地">団地</option><option value="公園" selected="">公園</option><option value="住宅街">住宅街</option><option value="AmazonDS">AmazonDS</option><option value="自宅営業所">自宅営業所</option></select></td>
+    <td><select class="note-select" style="width:100%;border:1.5px solid var(--border);border-radius:6px;padding:6px 3px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white"><option value="">摘要</option><option value="集荷">集荷</option><option value="配送">配送</option><option value="休憩" selected="">休憩</option><option value="持ち戻り">持ち戻り</option><option value="帰庫">帰庫</option><option value="その他">その他</option></select></td>
+    <td><button class="del-row-btn" onclick="this.closest('tr').remove()">×</button></td>
+  </tr><tr>
+    <td><div style="display:flex;align-items:center;gap:2px">
+    <select style="width:50px;border:1.5px solid var(--border);border-radius:6px;padding:5px 2px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white"><option value="0">00</option><option value="1">01</option><option value="2">02</option><option value="3">03</option><option value="4">04</option><option value="5">05</option><option value="6">06</option><option value="7">07</option><option value="8">08</option><option value="9">09</option><option value="10">10</option><option value="11">11</option><option value="12" selected="">12</option><option value="13">13</option><option value="14">14</option><option value="15">15</option><option value="16">16</option><option value="17">17</option><option value="18">18</option><option value="19">19</option><option value="20">20</option><option value="21">21</option><option value="22">22</option><option value="23">23</option></select>
+    <span style="color:var(--teal);font-weight:700">:</span>
+    <select style="width:50px;border:1.5px solid var(--border);border-radius:6px;padding:5px 2px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white"><option value="0">00</option>,<option value="5">05</option>,<option value="10">10</option>,<option value="15">15</option>,<option value="20">20</option>,<option value="25">25</option>,<option value="30" selected="">30</option>,<option value="35">35</option>,<option value="40">40</option>,<option value="45">45</option>,<option value="50">50</option>,<option value="55">55</option></select>
+  </div></td>
+    <td><div style="display:flex;align-items:center;gap:2px">
+    <select style="width:50px;border:1.5px solid var(--border);border-radius:6px;padding:5px 2px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white"><option value="0">00</option><option value="1">01</option><option value="2">02</option><option value="3">03</option><option value="4">04</option><option value="5">05</option><option value="6">06</option><option value="7">07</option><option value="8">08</option><option value="9">09</option><option value="10">10</option><option value="11">11</option><option value="12">12</option><option value="13">13</option><option value="14">14</option><option value="15" selected="">15</option><option value="16">16</option><option value="17">17</option><option value="18">18</option><option value="19">19</option><option value="20">20</option><option value="21">21</option><option value="22">22</option><option value="23">23</option></select>
+    <span style="color:var(--teal);font-weight:700">:</span>
+    <select style="width:50px;border:1.5px solid var(--border);border-radius:6px;padding:5px 2px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white"><option value="0">00</option>,<option value="5">05</option>,<option value="10">10</option>,<option value="15">15</option>,<option value="20">20</option>,<option value="25">25</option>,<option value="30" selected="">30</option>,<option value="35">35</option>,<option value="40">40</option>,<option value="45">45</option>,<option value="50">50</option>,<option value="55">55</option></select>
+  </div></td>
+    <td><select class="dest-select"><option value="">-- 行先を選択 --</option><option value="Amazon DS">Amazon DS</option><option value="団地">団地</option><option value="公園">公園</option><option value="住宅街" selected="">住宅街</option><option value="AmazonDS">AmazonDS</option><option value="自宅営業所">自宅営業所</option></select></td>
+    <td><select class="note-select" style="width:100%;border:1.5px solid var(--border);border-radius:6px;padding:6px 3px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white"><option value="">摘要</option><option value="集荷">集荷</option><option value="配送" selected="">配送</option><option value="休憩">休憩</option><option value="持ち戻り">持ち戻り</option><option value="帰庫">帰庫</option><option value="その他">その他</option></select></td>
+    <td><button class="del-row-btn" onclick="this.closest('tr').remove()">×</button></td>
+  </tr><tr>
+    <td><div style="display:flex;align-items:center;gap:2px">
+    <select style="width:50px;border:1.5px solid var(--border);border-radius:6px;padding:5px 2px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white"><option value="0">00</option><option value="1">01</option><option value="2">02</option><option value="3">03</option><option value="4">04</option><option value="5">05</option><option value="6">06</option><option value="7">07</option><option value="8">08</option><option value="9">09</option><option value="10">10</option><option value="11">11</option><option value="12">12</option><option value="13">13</option><option value="14">14</option><option value="15" selected="">15</option><option value="16">16</option><option value="17">17</option><option value="18">18</option><option value="19">19</option><option value="20">20</option><option value="21">21</option><option value="22">22</option><option value="23">23</option></select>
+    <span style="color:var(--teal);font-weight:700">:</span>
+    <select style="width:50px;border:1.5px solid var(--border);border-radius:6px;padding:5px 2px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white"><option value="0">00</option>,<option value="5">05</option>,<option value="10">10</option>,<option value="15">15</option>,<option value="20">20</option>,<option value="25">25</option>,<option value="30" selected="">30</option>,<option value="35">35</option>,<option value="40">40</option>,<option value="45">45</option>,<option value="50">50</option>,<option value="55">55</option></select>
+  </div></td>
+    <td><div style="display:flex;align-items:center;gap:2px">
+    <select style="width:50px;border:1.5px solid var(--border);border-radius:6px;padding:5px 2px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white"><option value="0">00</option><option value="1">01</option><option value="2">02</option><option value="3">03</option><option value="4">04</option><option value="5">05</option><option value="6">06</option><option value="7">07</option><option value="8">08</option><option value="9">09</option><option value="10">10</option><option value="11">11</option><option value="12">12</option><option value="13">13</option><option value="14">14</option><option value="15">15</option><option value="16" selected="">16</option><option value="17">17</option><option value="18">18</option><option value="19">19</option><option value="20">20</option><option value="21">21</option><option value="22">22</option><option value="23">23</option></select>
+    <span style="color:var(--teal);font-weight:700">:</span>
+    <select style="width:50px;border:1.5px solid var(--border);border-radius:6px;padding:5px 2px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white"><option value="0" selected="">00</option>,<option value="5">05</option>,<option value="10">10</option>,<option value="15">15</option>,<option value="20">20</option>,<option value="25">25</option>,<option value="30">30</option>,<option value="35">35</option>,<option value="40">40</option>,<option value="45">45</option>,<option value="50">50</option>,<option value="55">55</option></select>
+  </div></td>
+    <td><select class="dest-select"><option value="">-- 行先を選択 --</option><option value="Amazon DS">Amazon DS</option><option value="団地">団地</option><option value="公園">公園</option><option value="住宅街">住宅街</option><option value="AmazonDS" selected="">AmazonDS</option><option value="自宅営業所">自宅営業所</option></select></td>
+    <td><select class="note-select" style="width:100%;border:1.5px solid var(--border);border-radius:6px;padding:6px 3px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white"><option value="">摘要</option><option value="集荷">集荷</option><option value="配送">配送</option><option value="休憩">休憩</option><option value="持ち戻り" selected="">持ち戻り</option><option value="帰庫">帰庫</option><option value="その他">その他</option></select></td>
+    <td><button class="del-row-btn" onclick="this.closest('tr').remove()">×</button></td>
+  </tr><tr>
+    <td><div style="display:flex;align-items:center;gap:2px">
+    <select style="width:50px;border:1.5px solid var(--border);border-radius:6px;padding:5px 2px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white"><option value="0">00</option><option value="1">01</option><option value="2">02</option><option value="3">03</option><option value="4">04</option><option value="5">05</option><option value="6">06</option><option value="7">07</option><option value="8">08</option><option value="9">09</option><option value="10">10</option><option value="11">11</option><option value="12">12</option><option value="13">13</option><option value="14">14</option><option value="15">15</option><option value="16" selected="">16</option><option value="17">17</option><option value="18">18</option><option value="19">19</option><option value="20">20</option><option value="21">21</option><option value="22">22</option><option value="23">23</option></select>
+    <span style="color:var(--teal);font-weight:700">:</span>
+    <select style="width:50px;border:1.5px solid var(--border);border-radius:6px;padding:5px 2px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white"><option value="0">00</option>,<option value="5">05</option>,<option value="10">10</option>,<option value="15" selected="">15</option>,<option value="20">20</option>,<option value="25">25</option>,<option value="30">30</option>,<option value="35">35</option>,<option value="40">40</option>,<option value="45">45</option>,<option value="50">50</option>,<option value="55">55</option></select>
+  </div></td>
+    <td><div style="display:flex;align-items:center;gap:2px">
+    <select style="width:50px;border:1.5px solid var(--border);border-radius:6px;padding:5px 2px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white"><option value="0">00</option><option value="1">01</option><option value="2">02</option><option value="3">03</option><option value="4">04</option><option value="5">05</option><option value="6">06</option><option value="7">07</option><option value="8">08</option><option value="9">09</option><option value="10">10</option><option value="11">11</option><option value="12">12</option><option value="13">13</option><option value="14">14</option><option value="15">15</option><option value="16">16</option><option value="17" selected="">17</option><option value="18">18</option><option value="19">19</option><option value="20">20</option><option value="21">21</option><option value="22">22</option><option value="23">23</option></select>
+    <span style="color:var(--teal);font-weight:700">:</span>
+    <select style="width:50px;border:1.5px solid var(--border);border-radius:6px;padding:5px 2px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white"><option value="0" selected="">00</option>,<option value="5">05</option>,<option value="10">10</option>,<option value="15">15</option>,<option value="20">20</option>,<option value="25">25</option>,<option value="30">30</option>,<option value="35">35</option>,<option value="40">40</option>,<option value="45">45</option>,<option value="50">50</option>,<option value="55">55</option></select>
+  </div></td>
+    <td><select class="dest-select"><option value="">-- 行先を選択 --</option><option value="Amazon DS">Amazon DS</option><option value="団地">団地</option><option value="公園">公園</option><option value="住宅街">住宅街</option><option value="AmazonDS">AmazonDS</option><option value="自宅営業所" selected="">自宅営業所</option></select></td>
+    <td><select class="note-select" style="width:100%;border:1.5px solid var(--border);border-radius:6px;padding:6px 3px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white"><option value="">摘要</option><option value="集荷">集荷</option><option value="配送">配送</option><option value="休憩">休憩</option><option value="持ち戻り">持ち戻り</option><option value="帰庫" selected="">帰庫</option><option value="その他">その他</option></select></td>
+    <td><button class="del-row-btn" onclick="this.closest('tr').remove()">×</button></td>
+  </tr></tbody>
+      </table>
+      <button class="add-row-btn" onclick="addRouteRow()">＋ 行を追加</button>
+    </div>
+  </div>
+
+  <!-- 行先管理モーダル -->
+  <div class="modal-overlay" id="dest-modal" onclick="closeDestModalOutside(event)">
+    <div class="modal-sheet">
+      <div class="modal-header">
+        <h2>📍 行先リスト管理</h2>
+        <button class="modal-close" onclick="closeDestModal()">✕</button>
+      </div>
+      <div class="dest-tag-list" id="dest-tag-list"></div>
+      <div class="dest-add-row">
+        <input type="text" id="new-dest-input" placeholder="新しい行先を入力" onkeydown="if(event.key==='Enter')addDest()">
+        <button onclick="addDest()">追加</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 摘要管理モーダル -->
+  <div class="modal-overlay" id="note-modal" onclick="closeNoteModalOutside(event)">
+    <div class="modal-sheet">
+      <div class="modal-header">
+        <h2>📝 摘要リスト管理</h2>
+        <button class="modal-close" onclick="closeNoteModal()">✕</button>
+      </div>
+      <div class="dest-tag-list" id="note-tag-list"></div>
+      <div class="dest-add-row">
+        <input type="text" id="new-note-input" placeholder="新しい摘要を入力" onkeydown="if(event.key==='Enter')addNote()">
+        <button onclick="addNote()">追加</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- メーター -->
+  <div class="card">
+    <div class="card-title">🔢 メーター・走行距離</div>
+    <div class="card-body">
+      <div class="field">
+        <label>本日メーター</label>
+        <div style="flex:1;display:flex;align-items:center;gap:6px">
+          <input type="number" id="meter-today" placeholder="例: 85000" oninput="calcDistance()" style="flex:1">
+          <span style="font-size:13px;color:var(--muted)">km</span>
+        </div>
+      </div>
+      <div class="field">
+        <label>前日メーター</label>
+        <div style="flex:1;display:flex;align-items:center;gap:6px">
+          <input type="number" id="meter-prev" placeholder="例: 84850" oninput="calcDistance()" style="flex:1">
+          <span style="font-size:13px;color:var(--muted)">km</span>
+        </div>
+      </div>
+      <div class="meter-result">
+        <span>本日走行距離</span>
+        <span class="meter-val" id="distance">— km</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- アルコールチェック -->
+  <div class="card">
+    <div class="card-title">🍶 アルコールチェック</div>
+    <div class="card-body">
+      <div class="alcohol-grid">
+        <div class="alcohol-block">
+          <div class="block-title">出発前</div>
+          <div class="field">
+            <label>時刻</label>
+            <div class="time-row">
+              <select id="alc-before-h" style="width:60px"><option value="0">00時</option><option value="1">01時</option><option value="2">02時</option><option value="3">03時</option><option value="4">04時</option><option value="5">05時</option><option value="6">06時</option><option value="7">07時</option><option value="8" selected="">08時</option><option value="9">09時</option><option value="10">10時</option><option value="11">11時</option><option value="12">12時</option><option value="13">13時</option><option value="14">14時</option><option value="15">15時</option><option value="16">16時</option><option value="17">17時</option><option value="18">18時</option><option value="19">19時</option><option value="20">20時</option><option value="21">21時</option><option value="22">22時</option><option value="23">23時</option></select>
+              <span class="time-sep">:</span>
+              <select id="alc-before-m" style="width:60px"><option value="0">00分</option><option value="5">05分</option><option value="10" selected="">10分</option><option value="15">15分</option><option value="20">20分</option><option value="25">25分</option><option value="30">30分</option><option value="35">35分</option><option value="40">40分</option><option value="45">45分</option><option value="50">50分</option><option value="55">55分</option></select>
+            </div>
+          </div>
+          <div class="field">
+            <label>方法</label>
+            <input type="text" placeholder="対面" id="alc-before-method">
+          </div>
+          <div class="field" style="margin-top:6px;">
+            <label>酒気</label>
+            <div class="toggle-group">
+              <input type="radio" name="alc-before" id="ab-none" value="なし" checked="">
+              <label for="ab-none">なし</label>
+              <input type="radio" name="alc-before" id="ab-yes" value="あり">
+              <label for="ab-yes" style="color:var(--red)">あり</label>
+            </div>
+          </div>
+        </div>
+        <div class="alcohol-block">
+          <div class="block-title">帰着後</div>
+          <div class="field">
+            <label>時刻</label>
+            <div class="time-row">
+              <select id="alc-after-h" style="width:60px"><option value="0">00時</option><option value="1">01時</option><option value="2">02時</option><option value="3">03時</option><option value="4">04時</option><option value="5">05時</option><option value="6">06時</option><option value="7">07時</option><option value="8">08時</option><option value="9">09時</option><option value="10">10時</option><option value="11">11時</option><option value="12">12時</option><option value="13">13時</option><option value="14">14時</option><option value="15">15時</option><option value="16">16時</option><option value="17" selected="">17時</option><option value="18">18時</option><option value="19">19時</option><option value="20">20時</option><option value="21">21時</option><option value="22">22時</option><option value="23">23時</option></select>
+              <span class="time-sep">:</span>
+              <select id="alc-after-m" style="width:60px"><option value="0">00分</option><option value="5" selected="">05分</option><option value="10">10分</option><option value="15">15分</option><option value="20">20分</option><option value="25">25分</option><option value="30">30分</option><option value="35">35分</option><option value="40">40分</option><option value="45">45分</option><option value="50">50分</option><option value="55">55分</option></select>
+            </div>
+          </div>
+          <div class="field">
+            <label>方法</label>
+            <input type="text" placeholder="対面" id="alc-after-method">
+          </div>
+          <div class="field" style="margin-top:6px;">
+            <label>酒気</label>
+            <div class="toggle-group">
+              <input type="radio" name="alc-after" id="aa-none" value="なし" checked="">
+              <label for="aa-none">なし</label>
+              <input type="radio" name="alc-after" id="aa-yes" value="あり">
+              <label for="aa-yes" style="color:var(--red)">あり</label>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="field" style="margin-top:12px;">
+        <label>確認者</label>
+        <input type="text" placeholder="確認者名" id="checker">
+      </div>
+      <div class="field">
+        <label>会社/営業所</label>
+        <input type="text" placeholder="例: 自宅営業所" id="office">
+      </div>
+    </div>
+  </div>
+
+  <div style="display:flex;gap:10px;margin-top:4px">
+    <button class="submit-btn" onclick="submitForm()" style="flex:1">✉ 保存</button>
+    <button class="submit-btn" onclick="exportPDF()" style="flex:1;background:#1e7a6f">📄 PDF出力</button>
+  </div>
+  <button class="submit-btn" onclick="copyHTML()" style="margin-top:10px;background:#555">📋 HTMLをコピー</button>
+
+</div>
+
+<div class="toast" id="toast">✅ 日報を保存しました</div>
+
+<script>
+// ── Dropdown builders ──────────────────────────────────────────
+function buildHourOptions(selId, defaultVal) {
+  const sel = document.getElementById(selId);
+  sel.innerHTML = Array.from({length:24},(_,i)=>
+    `<option value="${i}" ${i===defaultVal?'selected':''}>${String(i).padStart(2,'0')}時</option>`
+  ).join('');
+}
+function buildMinOptions(selId, defaultVal, step=5) {
+  const sel = document.getElementById(selId);
+  const opts = [];
+  for(let m=0;m<60;m+=step) opts.push(`<option value="${m}" ${m===defaultVal?'selected':''}>${String(m).padStart(2,'0')}分</option>`);
+  sel.innerHTML = opts.join('');
+}
+function buildYearOptions() {
+  const sel = document.getElementById('sel-year');
+  const now = new Date();
+  const y = now.getFullYear();
+  sel.innerHTML = Array.from({length:5},(_,i)=>
+    `<option value="${y-2+i}" ${y-2+i===y?'selected':''}>${y-2+i}</option>`
+  ).join('');
+}
+function buildMonthOptions() {
+  const sel = document.getElementById('sel-month');
+  const now = new Date();
+  sel.innerHTML = Array.from({length:12},(_,i)=>
+    `<option value="${i+1}" ${i+1===now.getMonth()+1?'selected':''}>${String(i+1).padStart(2,'0')}</option>`
+  ).join('');
+}
+function buildDayOptions() {
+  const sel = document.getElementById('sel-day');
+  const now = new Date();
+  sel.innerHTML = Array.from({length:31},(_,i)=>
+    `<option value="${i+1}" ${i+1===now.getDate()?'selected':''}>${String(i+1).padStart(2,'0')}</option>`
+  ).join('');
+}
+
+// Init date selects
+buildYearOptions(); buildMonthOptions(); buildDayOptions();
+
+function updateWeekday() {
+  const days = ['日','月','火','水','木','金','土'];
+  const y = document.getElementById('sel-year').value;
+  const mo = document.getElementById('sel-month').value;
+  const d = document.getElementById('sel-day').value;
+  const dt = new Date(`${y}-${String(mo).padStart(2,'0')}-${String(d).padStart(2,'0')}T00:00:00`);
+  document.getElementById('weekday').value = days[dt.getDay()] + '曜日';
+}
+updateWeekday();
+
+// Init time selects
+buildHourOptions('out-h', 8);  buildMinOptions('out-m', 10);
+buildHourOptions('in-h', 17);  buildMinOptions('in-m', 0);
+buildHourOptions('alc-before-h', 8);  buildMinOptions('alc-before-m', 10);
+buildHourOptions('alc-after-h', 17);  buildMinOptions('alc-after-m', 5);
+
+// Calc drive time
+function calcDriveTime() {
+  const oh = parseInt(document.getElementById('out-h').value);
+  const om = parseInt(document.getElementById('out-m').value);
+  const ih = parseInt(document.getElementById('in-h').value);
+  const im = parseInt(document.getElementById('in-m').value);
+  if (isNaN(oh)||isNaN(om)||isNaN(ih)||isNaN(im)) { document.getElementById('drive-time').textContent = '—'; return; }
+  let mins = (ih * 60 + im) - (oh * 60 + om);
+  if (mins < 0) mins += 24 * 60;
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  document.getElementById('drive-time').textContent = `${h}時間 ${m}分`;
+}
+calcDriveTime();
+
+// Calc distance
+function calcDistance() {
+  const t = parseInt(document.getElementById('meter-today').value);
+  const p = parseInt(document.getElementById('meter-prev').value);
+  if (!isNaN(t) && !isNaN(p)) {
+    document.getElementById('distance').textContent = (t - p) + ' km';
+  } else {
+    document.getElementById('distance').textContent = '— km';
+  }
+}
+
+// Note (摘要) list — localStorage
+let noteOptions = JSON.parse(localStorage.getItem('noteOptions') || 'null') || ['集荷','配送','休憩','持ち戻り','帰庫','その他'];
+
+function saveNotes() { localStorage.setItem('noteOptions', JSON.stringify(noteOptions)); }
+
+function buildNoteOptions(selected) {
+  const placeholder = `<option value="">摘要</option>`;
+  const opts = noteOptions.map(n =>
+    `<option value="${n}" ${n === selected ? 'selected' : ''}>${n}</option>`
+  ).join('');
+  return placeholder + opts;
+}
+
+function refreshAllNoteSelects() {
+  document.querySelectorAll('.note-select').forEach(sel => {
+    const cur = sel.value;
+    sel.innerHTML = buildNoteOptions(cur);
+  });
+}
+
+function renderNoteTags() {
+  const list = document.getElementById('note-tag-list');
+  list.innerHTML = noteOptions.map((n, i) => `
+    <div class="dest-tag">
+      ${n}
+      <button onclick="removeNote(${i})" title="削除">×</button>
+    </div>
+  `).join('');
+}
+
+function addNote() {
+  const input = document.getElementById('new-note-input');
+  const val = input.value.trim();
+  if (!val || noteOptions.includes(val)) return;
+  noteOptions.push(val);
+  saveNotes();
+  input.value = '';
+  renderNoteTags();
+  refreshAllNoteSelects();
+}
+
+function removeNote(i) {
+  noteOptions.splice(i, 1);
+  saveNotes();
+  renderNoteTags();
+  refreshAllNoteSelects();
+}
+
+function openNoteModal() {
+  renderNoteTags();
+  document.getElementById('note-modal').classList.add('open');
+}
+
+function closeNoteModal() {
+  document.getElementById('note-modal').classList.remove('open');
+}
+
+function closeNoteModalOutside(e) {
+  if (e.target === document.getElementById('note-modal')) closeNoteModal();
+}
+
+// Destination list (localStorage)
+let destinations = JSON.parse(localStorage.getItem('destinations') || 'null') || [
+  'Amazon DS', '団地', '公園', '住宅街', 'AmazonDS', '自宅営業所'
+];
+
+function saveDests() { localStorage.setItem('destinations', JSON.stringify(destinations)); }
+
+function buildDestOptions(selected) {
+  const placeholder = `<option value="">-- 行先を選択 --</option>`;
+  const opts = destinations.map(d =>
+    `<option value="${d}" ${d === selected ? 'selected' : ''}>${d}</option>`
+  ).join('');
+  return placeholder + opts;
+}
+
+function renderDestTags() {
+  const list = document.getElementById('dest-tag-list');
+  list.innerHTML = destinations.map((d, i) => `
+    <div class="dest-tag">
+      ${d}
+      <button onclick="removeDest(${i})" title="削除">×</button>
+    </div>
+  `).join('');
+}
+
+function addDest() {
+  const input = document.getElementById('new-dest-input');
+  const val = input.value.trim();
+  if (!val || destinations.includes(val)) return;
+  destinations.push(val);
+  saveDests();
+  input.value = '';
+  renderDestTags();
+  refreshAllDestSelects();
+}
+
+function removeDest(i) {
+  destinations.splice(i, 1);
+  saveDests();
+  renderDestTags();
+  refreshAllDestSelects();
+}
+
+function refreshAllDestSelects() {
+  document.querySelectorAll('.dest-select').forEach(sel => {
+    const current = sel.value;
+    sel.innerHTML = buildDestOptions(current);
+  });
+}
+
+function openDestModal() {
+  renderDestTags();
+  document.getElementById('dest-modal').classList.add('open');
+}
+
+function closeDestModal() {
+  document.getElementById('dest-modal').classList.remove('open');
+}
+
+function closeDestModalOutside(e) {
+  if (e.target === document.getElementById('dest-modal')) closeDestModal();
+}
+
+// Route rows
+const defaultRoutes = [
+  { from: '8:15', to: '9:00', dest: 'Amazon DS', note: '集荷' },
+  { from: '9:15', to: '12:00', dest: '団地', note: '配送' },
+  { from: '12:00', to: '12:30', dest: '公園', note: '休憩' },
+  { from: '12:30', to: '15:30', dest: '住宅街', note: '配送' },
+  { from: '15:30', to: '16:00', dest: 'AmazonDS', note: '持ち戻り' },
+  { from: '16:15', to: '17:00', dest: '自宅営業所', note: '帰庫' },
+];
+
+function buildTimeSelectsHTML(val) {
+  const parts = (val||'').split(':');
+  const hv = parseInt(parts[0]) || 0;
+  const mv = parseInt(parts[1]) || 0;
+  const hOpts = Array.from({length:24},(_,i)=>
+    `<option value="${i}" ${i===hv?'selected':''}>${String(i).padStart(2,'0')}</option>`).join('');
+  const mOpts = [];
+  for(let m=0;m<60;m+=5) mOpts.push(`<option value="${m}" ${m===mv?'selected':''}>${String(m).padStart(2,'0')}</option>`);
+  return `<div style="display:flex;align-items:center;gap:2px">
+    <select style="width:50px;border:1.5px solid var(--border);border-radius:6px;padding:5px 2px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white">${hOpts}</select>
+    <span style="color:var(--teal);font-weight:700">:</span>
+    <select style="width:50px;border:1.5px solid var(--border);border-radius:6px;padding:5px 2px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white">${mOpts}</select>
+  </div>`;
+}
+
+function addRouteRow(data) {
+  const tbody = document.getElementById('route-body');
+  const tr = document.createElement('tr');
+  tr.innerHTML = `
+    <td>${buildTimeSelectsHTML(data?.from||'')}</td>
+    <td>${buildTimeSelectsHTML(data?.to||'')}</td>
+    <td><select class="dest-select">${buildDestOptions(data?.dest||'')}</select></td>
+    <td><select class="note-select" style="width:100%;border:1.5px solid var(--border);border-radius:6px;padding:6px 3px;font-size:12px;font-family:inherit;-webkit-appearance:none;appearance:none;background:white">${buildNoteOptions(data?.note||'')}</select></td>
+    <td><button class="del-row-btn" onclick="this.closest('tr').remove()">×</button></td>
+  `;
+  tbody.appendChild(tr);
+}
+
+defaultRoutes.forEach(r => addRouteRow(r));
+
+// Submit / toast
+function submitForm() {
+  const toast = document.getElementById('toast');
+  toast.classList.add('show');
+  setTimeout(() => toast.classList.remove('show'), 2500);
+}
+
+// Alc defaults
+document.getElementById('alc-before-method').value = '対面';
+document.getElementById('alc-after-method').value = '対面';
+document.getElementById('office').value = '自宅営業所';
+calcDistance();
+
+// ── HTMLコピー ─────────────────────────────────────────────────
+function copyHTML() {
+  const html = document.documentElement.outerHTML;
+  navigator.clipboard.writeText(html).then(() => {
+    const toast = document.getElementById('toast');
+    toast.textContent = '📋 HTMLをコピーしました！';
+    toast.classList.add('show');
+    setTimeout(() => { toast.classList.remove('show'); toast.textContent = '✅ 日報を保存しました'; }, 3000);
+  }).catch(() => {
+    alert('コピーに失敗しました。ブラウザの設定を確認してください。');
+  });
+}
+function exportPDF() {
+  // Collect data
+  const y = document.getElementById('sel-year').value;
+  const mo = document.getElementById('sel-month').value;
+  const d = document.getElementById('sel-day').value;
+  const dateStr = `${y}年${mo}月${d}日`;
+  const weekday = document.getElementById('weekday').value;
+  const driver = document.getElementById('driver-name').value || '—';
+  const vehicle = document.getElementById('vehicle-no').value || '—';
+  const outH = String(document.getElementById('out-h').value).padStart(2,'0');
+  const outM = String(document.getElementById('out-m').value).padStart(2,'0');
+  const inH  = String(document.getElementById('in-h').value).padStart(2,'0');
+  const inM  = String(document.getElementById('in-m').value).padStart(2,'0');
+  const driveTime = document.getElementById('drive-time').textContent;
+  const distance = document.getElementById('distance').textContent;
+  const meterToday = document.getElementById('meter-today').value || '—';
+  const meterPrev  = document.getElementById('meter-prev').value || '—';
+  const office = document.getElementById('office').value || '—';
+  const checker = document.getElementById('checker').value || '—';
+  const alcBeforeH = String(document.getElementById('alc-before-h').value).padStart(2,'0');
+  const alcBeforeM = String(document.getElementById('alc-before-m').value).padStart(2,'0');
+  const alcAfterH  = String(document.getElementById('alc-after-h').value).padStart(2,'0');
+  const alcAfterM  = String(document.getElementById('alc-after-m').value).padStart(2,'0');
+  const alcBeforeMethod = document.getElementById('alc-before-method').value || '—';
+  const alcAfterMethod  = document.getElementById('alc-after-method').value || '—';
+  const alcBefore = document.querySelector('input[name="alc-before"]:checked')?.value || '—';
+  const alcAfter  = document.querySelector('input[name="alc-after"]:checked')?.value || '—';
+
+  // Checks
+  const checks = [...document.querySelectorAll('.check-item input[type="checkbox"]')].map(cb => ({
+    label: cb.closest('.check-item').querySelector('.check-text').textContent,
+    checked: cb.checked
+  }));
+
+  // Routes
+  const rows = [...document.querySelectorAll('#route-body tr')].map(tr => {
+    const sels = tr.querySelectorAll('select');
+    // from: sels[0]=fromH, sels[1]=fromM, to: sels[2]=toH, sels[3]=toM, dest: sels[4], note: sels[5]
+    const fromH = String(sels[0]?.value||'').padStart(2,'0');
+    const fromM = String(sels[1]?.value||'').padStart(2,'0');
+    const toH   = String(sels[2]?.value||'').padStart(2,'0');
+    const toM   = String(sels[3]?.value||'').padStart(2,'0');
+    const dest  = sels[4]?.value || '—';
+    const note  = sels[5]?.value || '—';
+    return { from:`${fromH}:${fromM}`, to:`${toH}:${toM}`, dest, note };
+  });
+
+  const routeRows = rows.map(r => `
+    <tr>
+      <td>${r.from}</td>
+      <td>${r.to}</td>
+      <td>${r.dest}</td>
+      <td>${r.note}</td>
+    </tr>`).join('');
+
+  const checkRows = checks.map(c => `
+    <tr>
+      <td>${c.label}</td>
+      <td style="text-align:center;color:${c.checked?'#2a9d8f':'#ccc'};font-size:16px">${c.checked?'✓':'✗'}</td>
+    </tr>`).join('');
+
+  const html = `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>運転日報 ${dateStr}</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;700&display=swap');
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Noto Sans JP', sans-serif; font-size: 12px; color: #1a2e2c; padding: 24px; }
+  h1 { text-align: center; font-size: 16px; margin-bottom: 16px; letter-spacing: 0.1em; border-bottom: 2px solid #2a9d8f; padding-bottom: 8px; }
+  h2 { font-size: 12px; background: #2a9d8f; color: white; padding: 5px 10px; margin: 14px 0 6px; border-radius: 4px; }
+  table { width: 100%; border-collapse: collapse; margin-bottom: 8px; }
+  td, th { border: 1px solid #cce8e4; padding: 5px 8px; }
+  th { background: #e8f7f5; font-weight: 700; width: 38%; }
+  .route-th { background: #e8f7f5; font-weight: 700; font-size: 11px; text-align: center; }
+  .footer { margin-top: 20px; font-size: 10px; color: #888; text-align: right; }
+  @media print { body { padding: 10px; } }
+</style>
+</head>
+<body>
+<h1>運転日報</h1>
+
+<h2>📋 基本情報</h2>
+<table>
+  <tr><th>運転年月日</th><td>${dateStr}（${weekday}）</td></tr>
+  <tr><th>運転者名</th><td>${driver}</td></tr>
+  <tr><th>車両番号</th><td>${vehicle}</td></tr>
+  <tr><th>出庫時間</th><td>${outH}:${outM}</td></tr>
+  <tr><th>入庫時間</th><td>${inH}:${inM}</td></tr>
+  <tr><th>運転時間</th><td>${driveTime}</td></tr>
+</table>
+
+<h2>✅ 点検事項</h2>
+<table>
+  <tr><th class="route-th">項目</th><th class="route-th">確認</th></tr>
+  ${checkRows}
+</table>
+
+<h2>🗺 発着・行先記録</h2>
+<table>
+  <tr>
+    <th class="route-th">発</th>
+    <th class="route-th">着</th>
+    <th class="route-th">行先</th>
+    <th class="route-th">摘要</th>
+  </tr>
+  ${routeRows}
+</table>
+
+<h2>🔢 メーター・走行距離</h2>
+<table>
+  <tr><th>本日メーター指針</th><td>${meterToday} km</td></tr>
+  <tr><th>前日メーター指針</th><td>${meterPrev} km</td></tr>
+  <tr><th>本日走行距離</th><td>${distance}</td></tr>
+  <tr><th>会社/営業所</th><td>${office}</td></tr>
+</table>
+
+<h2>🍶 アルコールチェック</h2>
+<table>
+  <tr><th>出発前 確認時刻</th><td>${alcBeforeH}:${alcBeforeM}</td></tr>
+  <tr><th>出発前 確認方法</th><td>${alcBeforeMethod}</td></tr>
+  <tr><th>出発前 酒気の有無</th><td>${alcBefore}</td></tr>
+  <tr><th>帰着後 確認時刻</th><td>${alcAfterH}:${alcAfterM}</td></tr>
+  <tr><th>帰着後 確認方法</th><td>${alcAfterMethod}</td></tr>
+  <tr><th>帰着後 酒気の有無</th><td>${alcAfter}</td></tr>
+  <tr><th>確認者</th><td>${checker}</td></tr>
+</table>
+
+<div class="footer">出力日時: ${new Date().toLocaleString('ja-JP')}</div>
+<script>window.onload=()=>{ window.print(); }<\/script>
+</body>
+</html>`;
+
+  const blob = new Blob([html], {type:'text/html;charset=utf-8'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `運転日報_${y}${String(mo).padStart(2,'0')}${String(d).padStart(2,'0')}.html`;
+  a.click();
+  URL.revokeObjectURL(url);
+
+  const toast = document.getElementById('toast');
+  toast.textContent = '📄 PDFファイルを出力しました';
+  toast.classList.add('show');
+  setTimeout(() => { toast.classList.remove('show'); toast.textContent = '✅ 日報を保存しました'; }, 3000);
+}
+</script>
+
+
+</body></html>
